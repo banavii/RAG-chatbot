@@ -1,106 +1,208 @@
+import os
 import gradio as gr
+
+from dotenv import load_dotenv
+from google import genai
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
-from google import genai
-from dotenv import load_dotenv
-import os
-import tempfile
+
+
+# --------------------------------------------------
+# Load environment variables
+# --------------------------------------------------
 
 load_dotenv()
 
-# Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in .env file")
+
+
+# --------------------------------------------------
+# Gemini client
+# --------------------------------------------------
+
 client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
+    api_key=GEMINI_API_KEY
 )
 
-# Embeddings
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="gemini-embedding-001"
-)
 
-# Store uploaded documents
+# --------------------------------------------------
+# Global vector store
+# --------------------------------------------------
+
 vectorstore = None
 
 
-def upload_pdf(pdf):
+# --------------------------------------------------
+# Process uploaded PDF
+# --------------------------------------------------
+
+def upload_pdf(pdf_file):
+
     global vectorstore
 
-    if pdf is None:
-        return "Please upload a PDF."
+    if pdf_file is None:
+        return "❌ Please upload a PDF first."
 
-    # Load PDF
-    loader = PyPDFLoader(pdf)
-    documents = loader.load()
+    try:
 
-    # Split into chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
+        # Get uploaded PDF path
+        pdf_path = pdf_file
 
-    chunks = splitter.split_documents(documents)
+        # Load PDF
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
 
-    # Create Chroma database
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name="uploaded_documents"
-    )
+        # Split PDF into chunks
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50
+        )
 
-    return f"✅ PDF uploaded! Created {len(chunks)} chunks."
+        chunks = splitter.split_documents(documents)
 
+        # Create Gemini embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="gemini-embedding-001"
+        )
+
+        # Store chunks in Chroma
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            collection_name="rag_chatbot_documents"
+        )
+
+        return (
+            f"✅ PDF processed successfully!\n\n"
+            f"📄 Pages: {len(documents)}\n"
+            f"🧩 Chunks created: {len(chunks)}"
+        )
+
+    except Exception as e:
+
+        return f"❌ Error processing PDF:\n{str(e)}"
+
+
+# --------------------------------------------------
+# Ask question
+# --------------------------------------------------
 
 def chat(question):
+
+    global vectorstore
+
     if vectorstore is None:
-        return "Please upload a PDF first."
+        return "❌ Please upload and process a PDF first."
 
-    # Retrieve relevant chunks
-    results = vectorstore.similarity_search(
-        question,
-        k=3
-    )
+    if not question.strip():
+        return "❌ Please enter a question."
 
-    context = "\n\n".join(
-        result.page_content for result in results
-    )
+    try:
 
-    prompt = f"""
-Answer the question using ONLY the provided context.
+        # Retrieve relevant chunks
+        results = vectorstore.similarity_search(
+            question,
+            k=3
+        )
+
+        # Combine retrieved chunks
+        context = "\n\n".join(
+            [doc.page_content for doc in results]
+        )
+
+        # Ask Gemini using retrieved context
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=f"""
+You are a helpful RAG chatbot.
+
+Answer the user's question using ONLY the information
+provided in the context below.
+
+If the answer cannot be found in the context, say:
+"I couldn't find the answer in the uploaded PDF."
+
+Do not make up information.
 
 Context:
 {context}
 
 Question:
 {question}
+"""
+        )
 
-If the answer is not present in the context, say:
-"I couldn't find this information in the provided document."
+        # Get unique source pages
+        pages = sorted(
+            set(
+                doc.metadata.get("page", 0) + 1
+                for doc in results
+            )
+        )
+
+        sources = "\n".join(
+            [f"- 📄 Page {page}" for page in pages]
+        )
+
+        # Final answer
+        return f"""
+### 🤖 RAG Answer
+
+{response.text}
+
+### 📚 Sources
+
+{sources}
 """
 
-    response = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt
+    except Exception as e:
+
+        return f"❌ Error:\n{str(e)}"
+
+
+# --------------------------------------------------
+# Gradio Interface
+# --------------------------------------------------
+
+with gr.Blocks(
+    title="RAG Chatbot"
+) as app:
+
+    gr.Markdown(
+        """
+# 📚 RAG Chatbot
+
+Upload a PDF and ask questions about its content.
+
+The chatbot uses **Gemini Embeddings + ChromaDB + Gemini** 
+to retrieve relevant information and generate answers.
+"""
     )
 
-    return response.text
-
-
-# Gradio UI
-with gr.Blocks(title="RAG Chatbot") as app:
-
-    gr.Markdown("# 📚 RAG Chatbot")
-    gr.Markdown("Upload a PDF and ask questions about it.")
+    # -----------------------------
+    # PDF Upload Section
+    # -----------------------------
 
     pdf = gr.File(
-        label="Upload PDF",
+        label="📄 Upload PDF",
         file_types=[".pdf"],
         type="filepath"
     )
 
-    upload_button = gr.Button("📥 Process PDF")
-    status = gr.Textbox(label="Status")
+    upload_button = gr.Button(
+        "📥 Process PDF"
+    )
+
+    status = gr.Textbox(
+        label="Status",
+        interactive=False
+    )
 
     upload_button.click(
         upload_pdf,
@@ -108,14 +210,24 @@ with gr.Blocks(title="RAG Chatbot") as app:
         outputs=status
     )
 
+    # -----------------------------
+    # Question Section
+    # -----------------------------
+
+    gr.Markdown("## 💬 Ask a Question")
+
     question = gr.Textbox(
         label="Ask a question",
         placeholder="What is the Waterfall model?"
     )
 
-    ask_button = gr.Button("🤖 Ask")
+    ask_button = gr.Button(
+        "🤖 Ask"
+    )
 
-    answer = gr.Markdown(label="RAG Answer")
+    answer = gr.Markdown(
+        label="RAG Answer"
+    )
 
     ask_button.click(
         chat,
@@ -123,5 +235,9 @@ with gr.Blocks(title="RAG Chatbot") as app:
         outputs=answer
     )
 
+
+# --------------------------------------------------
+# Launch application
+# --------------------------------------------------
 
 app.launch()
